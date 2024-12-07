@@ -1,211 +1,118 @@
-# ROS2 imports
-import rclpy
-
-# for subscribing to sensor data
-from perceptions.ros.utils.PredictNode import PredictNode
-
-# for doing prediction on sensor data
-from perc22a.predictors.lidar.LidarPredictor import LidarPredictor
-
-# ROS2 imports
 import rclpy
 from rclpy.node import Node
+from visualization_msgs.msg import Marker, MarkerArray
+from interfaces.msg import ConeArray
 from rclpy.qos import QoSProfile, QoSReliabilityPolicy, QoSHistoryPolicy, QoSDurabilityPolicy
+import argparse
+import sys
 
-# ROS2 message types
-from sensor_msgs.msg import PointCloud2
-from geometry_msgs.msg import TwistStamped, QuaternionStamped
+NODE_NAME = 'foxglove_node'
 
-# ROS2 msg to python datatype conversions
-import perceptions.ros.utils.conversions as conv
-from perceptions.topics import POINT_TOPIC, TWIST_TOPIC, QUAT_TOPIC
+BEST_EFFORT_QOS_PROFILE = QoSProfile(
+    reliability=QoSReliabilityPolicy.BEST_EFFORT,
+    history=QoSHistoryPolicy.KEEP_LAST,
+    durability=QoSDurabilityPolicy.VOLATILE,
+    depth=1
+)
 
-# perceptions Library visualization functions (for 3D data)
-import perc22a.predictors.utils.lidar.visualization as vis
-from perc22a.data.utils.DataType import DataType
-from perc22a.data.utils.DataInstance import DataInstance
-
-# Cone Merger and pipeline enum type
-from perc22a.mergers.MergerInterface import Merger
-from perc22a.mergers.PipelineType import PipelineType
-from perc22a.mergers.merger_factory import \
-    create_lidar_merger, \
-    create_zed_merger, \
-    create_all_merger, \
-    create_any_merger
-
-from interfaces.msg import SplineFrames, EndToEndDebug, ConeArray
-from geometry_msgs.msg import Point
-
-import perceptions.ros.utils.conversions as conv
-from perc22a.svm.SVM import SVM
-from perc22a.predictors.utils.vis.Vis2D import Vis2D
-from perc22a.utils.Timer import Timer
-
-from perc22a.predictors.utils.ConeState import ConeState
-
-import time
-
-NODE_NAME = "end_to_end_node"
-
-# configure QOS profile
-BEST_EFFORT_QOS_PROFILE = QoSProfile(reliability = QoSReliabilityPolicy.BEST_EFFORT,
-                         history = QoSHistoryPolicy.KEEP_LAST,
-                         durability = QoSDurabilityPolicy.VOLATILE,
-                         depth = 1)
-RELIABLE_QOS_PROFILE = QoSProfile(reliability = QoSReliabilityPolicy.RELIABLE,
-                         history = QoSHistoryPolicy.KEEP_LAST,
-                         durability = QoSDurabilityPolicy.VOLATILE,
-                         depth = 1)
-
-class EndToEndNode(Node):
-
-    def __init__(self):
+class FoxgloveNode(Node):
+    def __init__(self, print_counts):
         super().__init__(NODE_NAME)
-
-        # data subscribers
-        self.point_subscriber = self.create_subscription(PointCloud2, POINT_TOPIC, self.points_callback, qos_profile=BEST_EFFORT_QOS_PROFILE)
-        self.twist_subscriber = self.create_subscription(TwistStamped, TWIST_TOPIC, self.twist_callback, qos_profile=RELIABLE_QOS_PROFILE)
-        self.quat_subscriber = self.create_subscription(QuaternionStamped, QUAT_TOPIC, self.quat_callback, qos_profile=RELIABLE_QOS_PROFILE)
-
-        # publishers
-        self.midline_pub = self.create_publisher(msg_type=SplineFrames,
-                                                 topic="/spline",
-                                                 qos_profile=BEST_EFFORT_QOS_PROFILE)
         
-        self.cones_pub = self.create_publisher(msg_type=ConeArray,
-                                               topic="/perc_cones",
-                                               qos_profile=BEST_EFFORT_QOS_PROFILE)
+        self.print_counts = print_counts
+        self.last_marker_count = 0  # Track the number of markers published previously
 
-        self.endToEndDebug_pub = self.create_publisher(msg_type= EndToEndDebug,
-                                                 topic="/endToEndDebug",
-                                                 qos_profile=BEST_EFFORT_QOS_PROFILE)
-
-        # parts of the pipeline 
-        self.predictor = self.init_predictor()
-        self.merger = create_lidar_merger()
-        self.cone_state = ConeState()
-        self.svm = SVM()
-
-        # attributes for storing twist and quaternion for motion modeling
-        self.curr_twist = None
-        self.curr_quat = None
-
-        # debugging utilities
-        # self.vis = Vis2D()
-        self.timer = Timer()
-        return
-    
-    def init_predictor(self):
-        return LidarPredictor()
-    
-    def twist_callback(self, curr_twist):
-        self.curr_twist = curr_twist
-
-    def quat_callback(self, curr_quat):
-        self.curr_quat = curr_quat
-    
-    def points_callback(self, msg):
-        # if doesn't have GPS data, return
-        if self.curr_twist is None or self.curr_quat is None:
-            self.get_logger().warn(f"No twist or quat data. Turn on GPS!")
-            return
-
-        # initialize time for staleness of data 
-        data_time = self.get_clock().now()
-
-        # convert pointcloud message into numpy array and get MotionInfo
-        data = {}
-        data[DataType.HESAI_POINTCLOUD] = conv.pointcloud2_to_npy(msg)
-        # data[DataType.HESAI_POINTCLOUD] = data[DataType.HESAI_POINTCLOUD][::3]
-        print("we have ", len(data[DataType.HESAI_POINTCLOUD]), " points")
-
-        mi = conv.gps_to_motion_info(self.curr_twist, self.curr_quat)
-
-        # predict lidar
-        self.timer.start("lidar")
-        cones = self.predictor.predict(data)
-        time_lidar = self.timer.end("lidar", ret=True)
-
-        # update using cone merger
-        self.timer.start("merge+color+state")
-        self.merger.add(cones, PipelineType.LIDAR)
-        cones = self.merger.merge()
-        self.merger.reset()
-
-        # recolor using SVM
-        cones = self.svm.recolor(cones)
-
-        # update overall cone state
-        # TODO: should separately update cones and then return cones relevant for svm
-        cones = self.cone_state.update(cones, mi)
-        time_state = self.timer.end("merge+color+state", ret=True)
-        cone_msg = conv.cones_to_msg(cones)
-        cone_msg.header.stamp = msg.header.stamp
-        self.cones_pub.publish(conv.cones_to_msg(cones))
-
-        # spline
-        self.timer.start("spline")
-        downsampled_boundary_points = self.svm.cones_to_midline(cones)
-        time_spline = self.timer.end("spline", ret=True)
-
-        # convert spline points to ROS2 SplineFrame message
-        points = []
-        new_msg = SplineFrames()
-        debugMSG = EndToEndDebug()
-
-        for np_point in downsampled_boundary_points:
-            new_point = Point()
-            new_point.x = float(np_point[0]) # turning into not SAE coordinates
-            new_point.y = float(np_point[1])
-            new_point.z = float(0)
-            points.append(new_point)
-
-        # self.vis.set_cones(cones)
-        # if len(downsampled_boundary_points) > 0:
-        #     self.vis.set_points(downsampled_boundary_points)
-        # self.vis.update()
-
-        if len(points) < 2:
-            print(f"LESS THAN 2 FRAMES {len(cones)}")
-            return
+        self.publisher_ = self.create_publisher(
+            MarkerArray,
+            'cone_markers',
+            10
+        )
         
-        new_msg.frames = points
-        new_msg.header.stamp = msg.header.stamp
-        new_msg.orig_data_stamp = data_time.to_msg()
-        self.midline_pub.publish(new_msg)
+        self.subscriber = self.create_subscription(
+            ConeArray,
+            '/perc_cones',
+            self.cone_array_callback,
+            qos_profile=BEST_EFFORT_QOS_PROFILE
+        )
 
+    def cone_array_callback(self, msg: ConeArray):
+        # Print cone counts if the flag is enabled
+        if self.print_counts:
+            print(
+                f"{len(msg.blue_cones):<3} Blue Cones | "
+                f"{len(msg.yellow_cones):<3} Yellow Cones | "
+                f"{len(msg.orange_cones):<3} Orange Cones | "
+                f"{len(msg.big_orange_cones):<3} Big Orange Cones | "
+                f"{len(msg.unknown_color_cones):<3} Unknown Color Cones"
+            )
+        
+        marker_array = self.create_marker_array(msg)
+        self.publisher_.publish(marker_array)
 
+    def create_marker_array(self, msg: ConeArray):
+        marker_array = MarkerArray()
+        marker_id = 0
+        namespace = "cone_markers"
 
-        # done publishing spline
-        curr_time = self.get_clock().now()
+        def add_cones(cones, color):
+            nonlocal marker_id
+            for cone in cones:
+                marker = Marker()
+                marker.header.frame_id = 'hesai_lidar'
+                marker.header.stamp = msg.header.stamp
+                marker.ns = namespace
+                marker.id = marker_id
+                marker.type = Marker.CUBE
+                marker.action = Marker.ADD
+                # Transforming coordinates as per the original code
+                marker.pose.position.x = cone.y
+                marker.pose.position.y = -cone.x
+                marker.pose.position.z = -0.7
+                marker.pose.orientation.w = 1.0
+                marker.scale.x = 0.2
+                marker.scale.y = 0.2
+                marker.scale.z = 0.2
+                marker.color.r = color[0] / 255.0
+                marker.color.g = color[1] / 255.0
+                marker.color.b = color[2] / 255.0
+                marker.color.a = 1.0
+                marker_array.markers.append(marker)
+                marker_id += 1
 
-        #Publish Debug Message
-        debugMSG.points.data = len(data[DataType.HESAI_POINTCLOUD])
-        debugMSG.cones.data = len(cones)
-        debugMSG.frames.data = len(downsampled_boundary_points)
-        debugMSG.overall_time.data = (curr_time.nanoseconds - data_time.nanoseconds) / 1000000
-        debugMSG.lidar_time.data = time_lidar
-        debugMSG.merge_color_state_time.data = time_state
-        debugMSG.spline_time.data = time_spline
-        self.endToEndDebug_pub.publish(debugMSG)
+        # Add cones from each category
+        add_cones(msg.blue_cones, [0, 0, 255])
+        add_cones(msg.yellow_cones, [255, 255, 0])
+        add_cones(msg.orange_cones, [255, 165, 0])
+        add_cones(msg.big_orange_cones, [255, 69, 0])
+        add_cones(msg.unknown_color_cones, [128, 128, 128])
 
-        # print the timings of everything
-        print(f"{len(cones):<3} cones {len(downsampled_boundary_points):<3} frames {(curr_time.nanoseconds - data_time.nanoseconds) / 1000000:.3f}ms lidar: {time_lidar:.1f}ms merge+color+state: {time_state:.1f}ms spline: {time_spline:.1f}ms")
+        # Delete leftover markers if any
+        for marker_id_to_delete in range(marker_id, self.last_marker_count):
+            delete_marker = Marker()
+            delete_marker.header.frame_id = 'hesai_lidar'
+            delete_marker.header.stamp = msg.header.stamp
+            delete_marker.ns = namespace
+            delete_marker.id = marker_id_to_delete
+            delete_marker.action = Marker.DELETE
+            marker_array.markers.append(delete_marker)
 
-        return
+        # Update the last marker count
+        self.last_marker_count = marker_id
+
+        return marker_array
 
 
 def main(args=None):
+    parser = argparse.ArgumentParser(description="Foxglove Cone Visualization Node")
+    parser.add_argument('-p', '--print', action='store_true', help="Print cone counts to the console")
+    parsed_args = parser.parse_args(args=sys.argv[1:])
+
     rclpy.init(args=args)
-
-    stereo_node = EndToEndNode()
-
-    rclpy.spin(stereo_node)
-
-    stereo_node.destroy_node()
+    node = FoxgloveNode(print_counts=parsed_args.print)
+    rclpy.spin(node)
+    node.destroy_node()
     rclpy.shutdown()
 
 
-if __name__ == "__main__":
+if __name__ == '__main__':
     main()
