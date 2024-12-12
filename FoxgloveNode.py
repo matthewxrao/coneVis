@@ -64,7 +64,6 @@ class FoxgloveNode(Node):
                 marker.id = marker_id
                 marker.type = Marker.CUBE
                 marker.action = Marker.ADD
-                # Transforming coordinates as per the original code
                 marker.pose.position.x = cone.y
                 marker.pose.position.y = -cone.x
                 marker.pose.position.z = -0.7
@@ -86,7 +85,7 @@ class FoxgloveNode(Node):
         add_cones(msg.big_orange_cones, [255, 69, 0])
         add_cones(msg.unknown_color_cones, [128, 128, 128])
 
-        # Delete leftover markers if any
+        # Delete leftover markers 
         for marker_id_to_delete in range(marker_id, self.last_marker_count):
             delete_marker = Marker()
             delete_marker.header.frame_id = 'hesai_lidar'
